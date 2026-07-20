@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import time
 import hashlib
 import requests
@@ -29,6 +30,10 @@ from typing import List, Dict, Optional
 from urllib.parse import urlparse
 
 from firecrawl import Firecrawl
+try:
+    from firecrawl.types import ClickAction, WaitAction, ExecuteJavascriptAction
+except ImportError:
+    ClickAction = WaitAction = ExecuteJavascriptAction = None
 
 # --------------------------------------------------------------------------
 # Config
@@ -319,29 +324,62 @@ class FirecrawlResearcher:
     def scrape_source(self, url: str, query: str = "", prompt: str = "",
                       context_terms: Optional[List[str]] = None) -> Source:
         """Scrape a single URL for markdown + html, then pull out images."""
-        try:
-            doc = self.client.scrape(
-                url,
-                formats=["markdown", "html", "links"],
-                # Deterministic HTML-level filter: strips nav/header/footer/ads
-                # before markdown conversion even happens.
-                only_main_content=True,
-                # Beta: extra LLM pass to mop up residual boilerplate
-                # (cookie banners, share widgets, related-article lists) that
-                # only_main_content can miss. Falls back gracefully if a given
-                # firecrawl-py version doesn't support the kwarg yet.
-                only_clean_content=True,
-            )
-        except TypeError:
-            # older firecrawl-py without only_clean_content support
+        host = urlparse(url).hostname or ""
+
+        # DigiKey: JS-rendered parametric table — try action-enabled
+        # approaches first, then fall back through progressively simpler
+        # strategies (WaitAction → only_main_content=False → JS → basic).
+        if "digikey" in host:
+            doc = self._digikey_scrape(url)
+            if doc is None:
+                return Source(url=url, query=query,
+                              error="All DigiKey scrape attempts failed")
+        else:
+            # --- Standard scrape strategy ---
+            actions = None
+            only_main = True
+            exclude = None
+
+            if re.search(r'\.(stackexchange|stackoverflow|superuser|serverfault|askubuntu)\.', host):
+                only_main = False
+                exclude = [
+                    ".s-topbar",
+                    ".left-sidebar",
+                    ".js-announcement-banner",
+                    "nav",
+                    "footer",
+                    "header",
+                ]
+                if ClickAction is not None:
+                    actions = [
+                        ClickAction(selector="a.js-show-link"),
+                        WaitAction(milliseconds=1500),
+                    ]
+
+            # --- Try scrape with retry on Fire Engine errors ---
             try:
                 doc = self.client.scrape(
-                    url, formats=["markdown", "html", "links"], only_main_content=True
+                    url,
+                    formats=["markdown", "html", "links"],
+                    only_main_content=only_main,
+                    exclude_tags=exclude,
+                    actions=actions,
                 )
             except Exception as e:
-                return Source(url=url, query=query, error=str(e))
-        except Exception as e:
-            return Source(url=url, query=query, error=str(e))
+                err_str = str(e)
+                if actions:
+                    try:
+                        doc = self.client.scrape(
+                            url,
+                            formats=["markdown", "html", "links"],
+                            only_main_content=only_main,
+                            exclude_tags=exclude,
+                            actions=None,
+                        )
+                    except Exception as e2:
+                        return Source(url=url, query=query, error=str(e2))
+                else:
+                    return Source(url=url, query=query, error=err_str)
 
         markdown = getattr(doc, "markdown", None) or (
             doc.get("markdown", "") if isinstance(doc, dict) else ""
@@ -396,6 +434,67 @@ class FirecrawlResearcher:
             markdown=content,
             images=images,
         )
+
+    def _digikey_scrape(self, url: str):
+        """Fallback chain for DigiKey pages (JS-rendered parametric table)."""
+        # a) WaitAction: wait for product table rows to appear
+        if WaitAction is not None:
+            try:
+                return self.client.scrape(
+                    url, formats=["markdown", "html", "links"],
+                    only_main_content=False,
+                    actions=[WaitAction(
+                        selector="[data-testid='BPN-Product-Table'] tr"
+                    )],
+                )
+            except Exception as e:
+                print(f"DigiKey: WaitAction(selector=) failed — {e}",
+                      file=sys.stderr)
+
+        # b) only_main_content=False — captures skeleton HTML at least
+        try:
+            return self.client.scrape(
+                url, formats=["markdown", "html", "links"],
+                only_main_content=False,
+            )
+        except Exception as e:
+            print(f"DigiKey: only_main_content=False failed — {e}",
+                  file=sys.stderr)
+
+        # c) ExecuteJavascriptAction: poll for table data to load
+        if ExecuteJavascriptAction is not None:
+            try:
+                return self.client.scrape(
+                    url, formats=["markdown", "html", "links"],
+                    only_main_content=False,
+                    actions=[ExecuteJavascriptAction(script="""
+                        new Promise(r => {
+                            let i = setInterval(() => {
+                                let rows = document.querySelectorAll(
+                                    '[data-testid="BPN-Product-Table"] tr, '
+                                    '[data-testid="BPN-Product-Table"] td'
+                                );
+                                if (rows.length > 0) { clearInterval(i); r(); }
+                            }, 200);
+                            setTimeout(r, 15000);
+                        });
+                    """)],
+                )
+            except Exception as e:
+                print(f"DigiKey: ExecuteJavascriptAction failed — {e}",
+                      file=sys.stderr)
+
+        # d) Final fallback: basic scrape with only_main_content=True
+        try:
+            print("DigiKey: all action/JS approaches failed, "
+                  "falling back to only_main_content=True",
+                  file=sys.stderr)
+            return self.client.scrape(
+                url, formats=["markdown", "html", "links"],
+                only_main_content=True,
+            )
+        except Exception:
+            return None
 
     # -- full pipeline -------------------------------------------------------
     def run_pipeline(

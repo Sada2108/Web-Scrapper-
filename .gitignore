@@ -1,2 +1,29 @@
-__pycache__/ 
-cache/ 
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Secrets / config
+.env
+env/
+gk/
+
+# Cache / output
+cache/
+
+# IDEs / editors
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Testing
+.pytest_cache/
+
+# Misc
+.python-version
