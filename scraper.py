@@ -58,6 +58,22 @@ SOURCE_HINT_SUFFIXES = [
     "circuit diagram",
 ]
 
+# Additional suffix pool targeting information-dense content: actual
+# component values, equations, biasing methods, and specs rather than
+# "what is this chip" overviews.  Merged with SOURCE_HINT_SUFFIXES below.
+SCHEMA_HINT_SUFFIXES = [
+    "gain resistor values",
+    "single supply biasing",
+    "output coupling capacitor value",
+    "decoupling capacitor placement",
+    "bandwidth frequency response",
+    "component values",
+    "bill of materials",
+    "PCB layout guidelines",
+]
+
+ALL_HINT_SUFFIXES = SOURCE_HINT_SUFFIXES + SCHEMA_HINT_SUFFIXES
+
 # Trusted-ish EE domains we bias toward when present in results (not a hard
 # filter -- just used for ranking).
 PREFERRED_DOMAINS = [
@@ -72,9 +88,9 @@ PREFERRED_DOMAINS = [
 # still appear if they're the only results, but preferred/manufacturer sources
 # always sort above them.
 DEPRIORITIZED_DOMAINS = [
-    "wikipedia.org", "wikihow.com", "instructables.com", "hackster.io",
+    "wikihow.com", "instructables.com", "hackster.io",
     "maker.pro", "electroschematics.com", "homemade-circuits.com",
-    "circuitbasics.com", "learningaboutelectronics.com", "randomnerdtutorials.com",
+    "circuitbasics.com", "randomnerdtutorials.com",
     "projecthub.arduino.cc", "create.arduino.cc", "medium.com", "dev.to",
     "hashnode.dev", "blogspot.com", "wordpress.com", "quora.com",
     "stackoverflow.com", "electronics.stackexchange.com",
@@ -102,10 +118,10 @@ EE_KEYWORD_PATTERNS = [
 ]
 
 # Generic part-number regex — matches IC part numbers like LM386, TL071,
-# OPA2340, MAX232, NE555 etc.  Run against the ORIGINAL-CASE prompt
-# (part numbers are case-sensitive, unlike the EE_KEYWORD_PATTERNS which
-# are searched case-insensitively on a lowercased prompt).
-_PART_NUMBER_RE = re.compile(r"\b([A-Z]{2,5})[\s\-]?(\d{2,5}[A-Z]?)\b")
+# OPA2340, MAX232, NE555 etc.  Case-insensitive so "lm386" matches as
+# well as "LM386".  When normalizing, the canonical form is UPPERCASE
+# (datasheets/search engines use uppercase part numbers).
+_PART_NUMBER_RE = re.compile(r"\b([A-Z]{2,5})[\s\-]?(\d{2,5}[A-Z]?)\b", re.IGNORECASE)
 
 
 def _extract_context_terms(prompt: str) -> List[str]:
@@ -117,9 +133,10 @@ def _extract_context_terms(prompt: str) -> List[str]:
     These are used to boost scoring in _block_text_score and _score_image.
     """
     terms = []
-    # Part numbers (case-sensitive, from original prompt)
+    # Part numbers (case-insensitive now; normalize to UPPERCASE so the
+    # canonical form is always "LM386", never "lm386" or "Lm386").
     for m in _PART_NUMBER_RE.finditer(prompt):
-        normalized = m.group(1) + m.group(2)
+        normalized = (m.group(1) + m.group(2)).upper()
         if normalized not in terms:
             terms.append(normalized)
     # EE keyword pattern matches (case-insensitive, from lowercased prompt)
@@ -189,41 +206,27 @@ def generate_search_queries(prompt: str, max_queries: int = 6) -> List[str]:
     (no external LLM call required); swap in an LLM-based planner later if
     you want richer query expansion.
     """
-    # --- 1. Match known EE keyword patterns (case-insensitive) ---
-    pattern_matches = []
-    lower_prompt = prompt.lower()
-    for pattern in EE_KEYWORD_PATTERNS:
-        m = re.search(pattern, lower_prompt, flags=re.IGNORECASE)
-        if m:
-            term = m.group(0).strip()
-            if term.lower() not in [f.lower() for f in pattern_matches]:
-                pattern_matches.append(term)
+    # --- 1. Extract context terms (part numbers + EE patterns) ---
+    # Uses the shared _extract_context_terms() so there's exactly ONE
+    # part-number and EE-keyword extraction implementation in this file.
+    context_terms = _extract_context_terms(prompt)
+    part_numbers = [t for t in context_terms if any(c.isdigit() for c in t)]
+    pattern_matches = [t for t in context_terms if not any(c.isdigit() for c in t)]
 
-    # --- 2. Extract IC part numbers (case-sensitive, original prompt) ---
-    # Part numbers (LM386, TL071, OPA2340, ...) are strong, unambiguous
-    # signals and are always prioritized over generic English words.
-    # Tolerate a space or hyphen between the letter prefix and digit suffix
-    # (e.g. "LM 386", "LM-386") and normalize by joining without separator.
-    part_numbers = []
-    for m in _PART_NUMBER_RE.finditer(prompt):
-        normalized = m.group(1) + m.group(2)
-        if normalized not in part_numbers:
-            part_numbers.append(normalized)
-
-    # --- 3. Fallback: naive word-split when neither pattern matched ---
+    # --- 2. Fallback: naive word-split when neither pattern matched ---
     # Allow alphanumeric characters so part numbers survive the split
     # (the old regex `[A-Za-z][A-Za-z\-]{3,}` silently dropped anything
     # containing digits like "LM386").  Apply STOPWORDS so filler words
     # like "using", "with", "from" never become search queries.
     fallback_words = []
-    if not pattern_matches and not part_numbers:
+    if not part_numbers and not pattern_matches:
         words = re.findall(r"[A-Za-z][A-Za-z0-9\-]{2,}", prompt)
         fallback_words = [
             w for w in dict.fromkeys(words)
             if w.lower() not in STOPWORDS
         ]
 
-    # --- 4. Merge: part numbers first, then pattern matches, then fallback ---
+    # --- 3. Merge: part numbers first, then pattern matches, then fallback ---
     found = part_numbers + pattern_matches + fallback_words
     seen = set()
     unique = []
@@ -234,11 +237,11 @@ def generate_search_queries(prompt: str, max_queries: int = 6) -> List[str]:
             unique.append(term)
     found = unique
 
-    # --- 5. Build queries: spread suffixes across the full list ---
-    # When max_queries < len(SOURCE_HINT_SUFFIXES), pick suffixes spread
-    # evenly across the entire list instead of taking the first N.  E.g.
-    # max_queries=6 out of 10 suffixes gives indices [0,1,3,5,6,8].
-    n_suffixes = len(SOURCE_HINT_SUFFIXES)
+    # --- 5. Build queries: spread suffixes across the full combined list ---
+    # SOURCE_HINT_SUFFIXES and SCHEMA_HINT_SUFFIXES are merged into
+    # ALL_HINT_SUFFIXES so value-targeted queries (component values,
+    # biasing, gain equations) interleave with conceptual/generic ones.
+    n_suffixes = len(ALL_HINT_SUFFIXES)
     if max_queries <= n_suffixes:
         step = n_suffixes / max_queries
         suffix_indices = [int(i * step) for i in range(max_queries)]
@@ -261,7 +264,7 @@ def generate_search_queries(prompt: str, max_queries: int = 6) -> List[str]:
             for ti in range(total_terms):
                 if term_counts[ti] < quotas[ti] and si < len(suffix_indices):
                     term = found[ti]
-                    suffix = SOURCE_HINT_SUFFIXES[suffix_indices[si]]
+                    suffix = ALL_HINT_SUFFIXES[suffix_indices[si]]
                     queries.append(f"{term} {suffix}")
                     si += 1
                     term_counts[ti] += 1

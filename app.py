@@ -80,7 +80,7 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    max_queries = st.slider("Search queries to generate", 2, 10, 6)
+    max_queries = st.slider("Search queries to generate", 2, 10, 10)
     results_per_query = st.slider("Results per query", 1, 10, 4)
     max_sources = st.slider("Max pages to scrape (total)", 3, 30, 12)
 
