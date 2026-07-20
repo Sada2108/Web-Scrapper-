@@ -51,6 +51,11 @@ SOURCE_HINT_SUFFIXES = [
     "reference design",
     "schematic",
     "circuit design",
+    "pinout",
+    "typical application circuit",
+    "components needed",
+    "how to use",
+    "circuit diagram",
 ]
 
 # Trusted-ish EE domains we bias toward when present in results (not a hard
@@ -74,7 +79,20 @@ EE_KEYWORD_PATTERNS = [
     r"Li-?ion battery", r"op[- ]amp", r"instrumentation amplifier",
     r"ADC", r"DAC", r"low noise amplifier", r"shunt resistor",
     r"current sense", r"voltage reference", r"PCB layout", r"ground plane",
+    # Generic circuit types — common request shapes that should hit a real
+    # pattern before ever reaching the naive word-split fallback.
+    r"audio amplifier", r"power supply", r"voltage regulator",
+    r"power amplifier", r"oscillator", r"filter circuit",
+    r"LED driver", r"motor driver", r"battery charger",
+    r"class [A-D] amplifier", r"preamp(?:lifier)?",
+    r"audio circuit", r"amplifier circuit",
 ]
+
+# Generic part-number regex — matches IC part numbers like LM386, TL071,
+# OPA2340, MAX232, NE555 etc.  Run against the ORIGINAL-CASE prompt
+# (part numbers are case-sensitive, unlike the EE_KEYWORD_PATTERNS which
+# are searched case-insensitively on a lowercased prompt).
+_PART_NUMBER_RE = re.compile(r"\b([A-Z]{2,5})[\s\-]?(\d{2,5}[A-Z]?)\b")
 
 
 # --------------------------------------------------------------------------
@@ -133,25 +151,87 @@ def generate_search_queries(prompt: str, max_queries: int = 6) -> List[str]:
     (no external LLM call required); swap in an LLM-based planner later if
     you want richer query expansion.
     """
-    found = []
+    # --- 1. Match known EE keyword patterns (case-insensitive) ---
+    pattern_matches = []
     lower_prompt = prompt.lower()
     for pattern in EE_KEYWORD_PATTERNS:
         m = re.search(pattern, lower_prompt, flags=re.IGNORECASE)
         if m:
             term = m.group(0).strip()
-            if term.lower() not in [f.lower() for f in found]:
-                found.append(term)
+            if term.lower() not in [f.lower() for f in pattern_matches]:
+                pattern_matches.append(term)
 
-    # Fallback: if nothing matched, just use noun-ish chunks (very naive)
-    if not found:
-        words = re.findall(r"[A-Za-z][A-Za-z\-]{3,}", prompt)
-        found = list(dict.fromkeys(words))[:max_queries]
+    # --- 2. Extract IC part numbers (case-sensitive, original prompt) ---
+    # Part numbers (LM386, TL071, OPA2340, ...) are strong, unambiguous
+    # signals and are always prioritized over generic English words.
+    # Tolerate a space or hyphen between the letter prefix and digit suffix
+    # (e.g. "LM 386", "LM-386") and normalize by joining without separator.
+    part_numbers = []
+    for m in _PART_NUMBER_RE.finditer(prompt):
+        normalized = m.group(1) + m.group(2)
+        if normalized not in part_numbers:
+            part_numbers.append(normalized)
+
+    # --- 3. Fallback: naive word-split when neither pattern matched ---
+    # Allow alphanumeric characters so part numbers survive the split
+    # (the old regex `[A-Za-z][A-Za-z\-]{3,}` silently dropped anything
+    # containing digits like "LM386").  Apply STOPWORDS so filler words
+    # like "using", "with", "from" never become search queries.
+    fallback_words = []
+    if not pattern_matches and not part_numbers:
+        words = re.findall(r"[A-Za-z][A-Za-z0-9\-]{2,}", prompt)
+        fallback_words = [
+            w for w in dict.fromkeys(words)
+            if w.lower() not in STOPWORDS
+        ]
+
+    # --- 4. Merge: part numbers first, then pattern matches, then fallback ---
+    found = part_numbers + pattern_matches + fallback_words
+    seen = set()
+    unique = []
+    for term in found:
+        key = term.lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(term)
+    found = unique
+
+    # --- 5. Build queries: spread suffixes across the full list ---
+    # When max_queries < len(SOURCE_HINT_SUFFIXES), pick suffixes spread
+    # evenly across the entire list instead of taking the first N.  E.g.
+    # max_queries=6 out of 10 suffixes gives indices [0,1,3,5,6,8].
+    n_suffixes = len(SOURCE_HINT_SUFFIXES)
+    if max_queries <= n_suffixes:
+        step = n_suffixes / max_queries
+        suffix_indices = [int(i * step) for i in range(max_queries)]
+    else:
+        suffix_indices = list(range(n_suffixes))
 
     queries = []
-    for term in found[:max_queries]:
-        # Pair each key term with one hint suffix to focus results
-        suffix = SOURCE_HINT_SUFFIXES[len(queries) % len(SOURCE_HINT_SUFFIXES)]
-        queries.append(f"{term} {suffix}")
+    if found:
+        total_terms = len(found)
+        # Per-term quotas: strongest term gets ceil, rest get floor.
+        quotas = []
+        for ti in range(total_terms):
+            base = max_queries // total_terms
+            extra = 1 if ti < (max_queries - base * total_terms) else 0
+            quotas.append(base + extra)
+        term_counts = [0] * total_terms
+        si = 0  # index into suffix_indices
+        while len(queries) < max_queries:
+            added = False
+            for ti in range(total_terms):
+                if term_counts[ti] < quotas[ti] and si < len(suffix_indices):
+                    term = found[ti]
+                    suffix = SOURCE_HINT_SUFFIXES[suffix_indices[si]]
+                    queries.append(f"{term} {suffix}")
+                    si += 1
+                    term_counts[ti] += 1
+                    added = True
+                    if len(queries) >= max_queries:
+                        break
+            if not added:
+                break
 
     if not queries:
         queries = [prompt[:80]]
