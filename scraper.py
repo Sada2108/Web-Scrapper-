@@ -67,6 +67,19 @@ PREFERRED_DOMAINS = [
     "circuitdigest.com", "edn.com",
 ]
 
+# Low-quality / content-marketing domains that tend to produce fluffy,
+# non-technical results. These are down-ranked (not hard-excluded) so they
+# still appear if they're the only results, but preferred/manufacturer sources
+# always sort above them.
+DEPRIORITIZED_DOMAINS = [
+    "wikipedia.org", "wikihow.com", "instructables.com", "hackster.io",
+    "maker.pro", "electroschematics.com", "homemade-circuits.com",
+    "circuitbasics.com", "learningaboutelectronics.com", "randomnerdtutorials.com",
+    "projecthub.arduino.cc", "create.arduino.cc", "medium.com", "dev.to",
+    "hashnode.dev", "blogspot.com", "wordpress.com", "quora.com",
+    "stackoverflow.com", "electronics.stackexchange.com",
+]
+
 # A lightweight EE vocabulary used to pull technical terms out of the prompt
 # when we don't want to (or can't) call an LLM to do query planning.
 EE_KEYWORD_PATTERNS = [
@@ -93,6 +106,31 @@ EE_KEYWORD_PATTERNS = [
 # (part numbers are case-sensitive, unlike the EE_KEYWORD_PATTERNS which
 # are searched case-insensitively on a lowercased prompt).
 _PART_NUMBER_RE = re.compile(r"\b([A-Z]{2,5})[\s\-]?(\d{2,5}[A-Z]?)\b")
+
+
+def _extract_context_terms(prompt: str) -> List[str]:
+    """
+    Extract the highest-priority technical terms from a prompt for use as
+    relevance signals downstream. Returns a list containing:
+      1. Part numbers (normalized, e.g. "LM386") — strongest signal
+      2. Matched EE_KEYWORD_PATTERNS terms (e.g. "audio amplifier") — strong signal
+    These are used to boost scoring in _block_text_score and _score_image.
+    """
+    terms = []
+    # Part numbers (case-sensitive, from original prompt)
+    for m in _PART_NUMBER_RE.finditer(prompt):
+        normalized = m.group(1) + m.group(2)
+        if normalized not in terms:
+            terms.append(normalized)
+    # EE keyword pattern matches (case-insensitive, from lowercased prompt)
+    lower_prompt = prompt.lower()
+    for pattern in EE_KEYWORD_PATTERNS:
+        m = re.search(pattern, lower_prompt, flags=re.IGNORECASE)
+        if m:
+            term = m.group(0).strip()
+            if term.lower() not in [t.lower() for t in terms]:
+                terms.append(term)
+    return terms
 
 
 # --------------------------------------------------------------------------
@@ -275,7 +313,8 @@ class FirecrawlResearcher:
         return out
 
     # -- scrape --------------------------------------------------------------
-    def scrape_source(self, url: str, query: str = "", prompt: str = "") -> Source:
+    def scrape_source(self, url: str, query: str = "", prompt: str = "",
+                      context_terms: Optional[List[str]] = None) -> Source:
         """Scrape a single URL for markdown + html, then pull out images."""
         try:
             doc = self.client.scrape(
@@ -320,7 +359,8 @@ class FirecrawlResearcher:
         # order they actually appear on the page, so an image never loses
         # the paragraph that gives it context.
         content, images = extract_interleaved_content(
-            markdown or "", prompt, max_chars=12000
+            markdown or "", prompt, max_chars=12000,
+            context_terms=context_terms,
         )
 
         # Safety net: some pages embed images (lazy-loaded, CSS background,
@@ -336,7 +376,7 @@ class FirecrawlResearcher:
         # by context in the first place.
         already_have = {img.url for img in images}
         html_images = [
-            img for img in extract_images(html or "", "")
+            img for img in extract_images(html or "", "", context_terms=context_terms)
             if img.url not in already_have and img.relevance_score > 0
         ]
         if html_images:
@@ -370,6 +410,7 @@ class FirecrawlResearcher:
         UI progress bars (e.g. from Streamlit).
         """
         queries = generate_search_queries(prompt, max_queries=max_queries)
+        context_terms = _extract_context_terms(prompt)
 
         candidates: List[Dict] = []
         for i, q in enumerate(queries):
@@ -381,13 +422,17 @@ class FirecrawlResearcher:
                     r["query"] = q
                     candidates.append(r)
 
-        candidates = _dedupe_and_rank(candidates)[:max_sources_to_scrape]
+        candidates = _dedupe_and_rank(
+            candidates,
+            part_numbers=[t for t in context_terms if any(c.isdigit() for c in t)],
+        )[:max_sources_to_scrape]
 
         sources: List[Source] = []
         for i, c in enumerate(candidates):
             if progress_cb:
                 progress_cb("scraping", i + 1, len(candidates))
-            src = self.scrape_source(c["url"], query=c.get("query", ""), prompt=prompt)
+            src = self.scrape_source(c["url"], query=c.get("query", ""), prompt=prompt,
+                                     context_terms=context_terms)
             if not src.title:
                 src.title = c.get("title", src.url)
             sources.append(src)
@@ -553,20 +598,26 @@ def _split_blocks(markdown: str) -> List[str]:
     return [b.strip() for b in raw_blocks if b.strip()]
 
 
-def _block_images(block: str) -> List["ScrapedImage"]:
+def _block_images(block: str, context_terms: Optional[List[str]] = None) -> List["ScrapedImage"]:
     imgs = []
     for m in MD_IMG_RE.finditer(block):
         alt, url = m.group(1), m.group(2)
-        imgs.append(ScrapedImage(url=url, alt=alt, relevance_score=_score_image(url, alt)))
+        imgs.append(ScrapedImage(url=url, alt=alt, relevance_score=_score_image(url, alt, context_terms)))
     return imgs
 
 
-def _block_text_score(block: str, prompt_terms, prompt_words) -> int:
+def _block_text_score(block: str, prompt_terms, prompt_words, context_terms=None) -> int:
     lower = block.lower()
     score = 0
     for term in prompt_terms:
         if term in lower:
             score += 3
+    # Prompt-specific context terms (part numbers, matched circuit types) get
+    # a much higher boost — they're the exact thing being designed around.
+    if context_terms:
+        for term in context_terms:
+            if term.lower() in lower:
+                score += 8
     score += sum(1 for w in prompt_words if w in lower)
     score += sum(1 for kw in RELEVANCE_KEYWORDS if kw in lower)
     if _UNIT_NUMBER_RE.search(lower):
@@ -577,7 +628,8 @@ def _block_text_score(block: str, prompt_terms, prompt_words) -> int:
 
 
 def extract_interleaved_content(
-    markdown: str, prompt: str, max_chars: int = 9000
+    markdown: str, prompt: str, max_chars: int = 9000,
+    context_terms: Optional[List[str]] = None,
 ):
     """
     Walk the scraped markdown top-to-bottom and keep the blocks (paragraphs,
@@ -611,7 +663,7 @@ def extract_interleaved_content(
     # classify + score every block, keeping original index for reordering
     scored = []  # (idx, kind, score, block, images_in_block)
     for idx, block in enumerate(blocks):
-        imgs = _block_images(block)
+        imgs = _block_images(block, context_terms)
         text_without_imgs = MD_IMG_RE.sub("", block).strip()
         is_image_block = bool(imgs) and len(text_without_imgs) < 20
         if is_image_block:
@@ -620,7 +672,7 @@ def extract_interleaved_content(
         else:
             if len(block) < 40:
                 continue  # stray menu items / bare links, not real content
-            score = _block_text_score(block, prompt_terms, prompt_words)
+            score = _block_text_score(block, prompt_terms, prompt_words, context_terms)
             scored.append((idx, "text", score, block, imgs))
 
     if not scored:
@@ -718,7 +770,7 @@ def extract_interleaved_content(
     return "\n\n".join(kept_blocks), kept_images
 
 
-def extract_images(html: str, markdown: str = "") -> List[ScrapedImage]:
+def extract_images(html: str, markdown: str = "", context_terms: Optional[List[str]] = None) -> List[ScrapedImage]:
     found: Dict[str, ScrapedImage] = {}
 
     for m in IMG_TAG_RE.finditer(html or ""):
@@ -726,24 +778,29 @@ def extract_images(html: str, markdown: str = "") -> List[ScrapedImage]:
         url = m.group(1)
         alt_match = ALT_RE.search(src)
         alt = alt_match.group(1) if alt_match else ""
-        found[url] = ScrapedImage(url=url, alt=alt, relevance_score=_score_image(url, alt))
+        found[url] = ScrapedImage(url=url, alt=alt, relevance_score=_score_image(url, alt, context_terms))
 
     for m in MD_IMG_RE.finditer(markdown or ""):
         alt, url = m.group(1), m.group(2)
         if url not in found:
-            found[url] = ScrapedImage(url=url, alt=alt, relevance_score=_score_image(url, alt))
+            found[url] = ScrapedImage(url=url, alt=alt, relevance_score=_score_image(url, alt, context_terms))
 
     images = list(found.values())
     images.sort(key=lambda i: i.relevance_score, reverse=True)
     return images
 
 
-def _score_image(url: str, alt: str) -> int:
+def _score_image(url: str, alt: str, context_terms: Optional[List[str]] = None) -> int:
     text = f"{url} {alt}".lower()
     score = 0
     for kw in RELEVANCE_KEYWORDS:
         if kw in text:
             score += 2
+    # Boost for prompt-specific context terms (part numbers, circuit types)
+    if context_terms:
+        for term in context_terms:
+            if term.lower() in text:
+                score += 5
     # Penalize obvious non-content images
     if any(kw in text for kw in JUNK_IMAGE_KEYWORDS):
         score -= 3
@@ -848,7 +905,7 @@ def extract_relevant_text(markdown: str, prompt: str, max_chars: int = 6000) -> 
     return "\n\n".join(t for _, t in selected)
 
 
-def _dedupe_and_rank(candidates: List[Dict]) -> List[Dict]:
+def _dedupe_and_rank(candidates: List[Dict], part_numbers: Optional[List[str]] = None) -> List[Dict]:
     seen = set()
     deduped = []
     for c in candidates:
@@ -861,7 +918,22 @@ def _dedupe_and_rank(candidates: List[Dict]) -> List[Dict]:
     def rank(c):
         domain = urlparse(c["url"]).netloc.replace("www.", "")
         preferred = any(pd in domain for pd in PREFERRED_DOMAINS)
-        return (0 if preferred else 1, domain)
+        deprioritized = any(dd in domain for dd in DEPRIORITIZED_DOMAINS)
+        # PDFs and datasheet paths are the most information-dense sources
+        is_pdf = c["url"].lower().endswith(".pdf") or "/datasheet" in c["url"].lower()
+        # Check for exact part-number match in URL, title, or matched query
+        url_title_query = f"{c.get('url', '')} {c.get('title', '')} {c.get('query', '')}"
+        has_pn = False
+        if part_numbers:
+            lower_utq = url_title_query.lower()
+            for pn in part_numbers:
+                if pn.lower() in lower_utq:
+                    has_pn = True
+                    break
+        # Domain tier: 0=preferred, 1=neutral, 2=deprioritized
+        tier = 0 if preferred else (2 if deprioritized else 1)
+        # Tuple: part-number match (0=yes), PDF (0=yes), domain tier, domain name
+        return (0 if has_pn else 1, 0 if is_pdf else 1, tier, domain)
 
     deduped.sort(key=rank)
     return deduped
