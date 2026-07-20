@@ -387,6 +387,18 @@ class FirecrawlResearcher:
         html = getattr(doc, "html", None) or (
             doc.get("html", "") if isinstance(doc, dict) else ""
         )
+
+        # Post-process: strip XenForo "Click to expand..." boilerplate.
+        # The content inside bbCodeBlock-expandContent divs is already fully
+        # present in the raw HTML -- the label is just UI chrome that pollutes
+        # the markdown output.  Scoped to AAC because the string is unlikely
+        # in natural prose, but theoretically possible.
+        if "allaboutcircuits.com" in host:
+            markdown = re.sub(
+                r'^[>\s]*Click to expand\.\.\.\s*$',
+                '', markdown, flags=re.MULTILINE,
+            )
+
         meta = getattr(doc, "metadata", None) or (
             doc.get("metadata", {}) if isinstance(doc, dict) else {}
         )
