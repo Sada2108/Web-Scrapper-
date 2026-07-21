@@ -18,6 +18,7 @@ Run with:  streamlit run app.py
 """
 
 import os
+import re
 import time
 import streamlit as st
 
@@ -202,12 +203,34 @@ if corpus:
         # renders the inline ![]() image syntax right where it occurs, so
         # you see "text, then its image, then text, then its image" as a
         # single continuous read instead of split tabs.
+        #
+        # PDF-extracted figures are stored as local files, not URLs --
+        # st.markdown can't serve arbitrary local paths, so we render
+        # those with st.image() instead and strip the broken refs from
+        # the markdown.
         for i, s in enumerate(ok_sources, 1):
             with st.container(border=True):
                 st.markdown(f"### {i}. {s.title}")
                 st.caption(f"🔗 [{s.url}]({s.url})  ·  matched query: *{s.query}*  ·  {len(s.images)} images")
+                local_imgs = [img for img in s.images if not img.url.startswith("http")]
                 if s.markdown.strip():
-                    st.markdown(s.markdown, unsafe_allow_html=False)
+                    # Strip local-path image refs from markdown (they won't render)
+                    if local_imgs:
+                        clean = re.sub(
+                            r'!\[([^\]]*)\]\((?!https?://)([^)]+)\)',
+                            '', s.markdown,
+                        )
+                        # Also remove the "Figures extracted from PDF:" heading
+                        # and surrounding blank lines left after stripping
+                        clean = re.sub(r'\n\s*\n\s*\n+', '\n\n', clean).strip()
+                    else:
+                        clean = s.markdown
+                    st.markdown(clean, unsafe_allow_html=False)
+                    for img in local_imgs:
+                        from pathlib import Path
+                        path = Path(img.url)
+                        if path.exists():
+                            st.image(str(path), caption=img.alt or None)
                 else:
                     st.info("No relevant content extracted from this page for your prompt.")
 

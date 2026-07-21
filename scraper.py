@@ -35,11 +35,18 @@ try:
 except ImportError:
     ClickAction = WaitAction = ExecuteJavascriptAction = None
 
+try:
+    from pdf_images import extract_pdf_figures, save_figures
+    _HAS_PDF = True
+except ImportError:
+    _HAS_PDF = False
+
 # --------------------------------------------------------------------------
 # Config
 # --------------------------------------------------------------------------
 
-CACHE_DIR = Path(os.environ.get("PCB_SCRAPER_CACHE", "./cache"))
+_MODULE_DIR = Path(__file__).parent.resolve()
+CACHE_DIR = Path(os.environ.get("PCB_SCRAPER_CACHE", str(_MODULE_DIR / "cache"))).resolve()
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # xAI Grok API (OpenAI-compatible chat completions endpoint). Used for the
@@ -398,6 +405,10 @@ class FirecrawlResearcher:
                 r'^[>\s]*Click to expand\.\.\.\s*$',
                 '', markdown, flags=re.MULTILINE,
             )
+            markdown = re.sub(
+                r'^[>\s]*<circuit diagram>\s*$',
+                '', markdown, flags=re.MULTILINE,
+            )
 
         meta = getattr(doc, "metadata", None) or (
             doc.get("metadata", {}) if isinstance(doc, dict) else {}
@@ -438,6 +449,39 @@ class FirecrawlResearcher:
             )
             content = (content + extra_block) if content else extra_block.strip()
             images = images + html_images[:15]
+
+        # -- PDF figure extraction ------------------------------------------------
+        # Firecrawl extracts text from PDFs but drops all embedded images.
+        # We fetch the raw PDF and run PyMuPDF ourselves to recover figures.
+        pdf_dir = CACHE_DIR / "pdf_figures"
+        if _HAS_PDF and url.lower().endswith(".pdf"):
+            try:
+                resp = requests.get(url, timeout=30)
+                if resp.status_code == 200 and len(resp.content) > 1000:
+                    pdf_figures = extract_pdf_figures(resp.content)
+                    saved = save_figures(pdf_figures, str(pdf_dir))
+                    already_have = {img.url for img in images}
+                    pdf_img_entries = []
+                    for entry in saved:
+                        local_path = entry["filepath"]
+                        if local_path in already_have:
+                            continue
+                        # Score on caption only -- the filepath contains the
+                        # directory name "pdf_figures" which would falsely
+                        # match the "figure" keyword for every image.
+                        score = _score_image("", entry["caption"], context_terms)
+                        if score > 0:
+                            pdf_img_entries.append(
+                                ScrapedImage(url=local_path, alt=entry["caption"], relevance_score=score)
+                            )
+                    if pdf_img_entries:
+                        extra = "\n\n**📎 Figures extracted from PDF:**\n\n" + "\n\n".join(
+                            f"![{img.alt}]({img.url})" for img in pdf_img_entries
+                        )
+                        content = (content + extra) if content else extra.strip()
+                        images = images + pdf_img_entries
+            except Exception as e:
+                print(f"PDF figure extraction failed for {url}: {e}", file=sys.stderr)
 
         return Source(
             url=url,
@@ -644,6 +688,7 @@ MD_IMG_RE = re.compile(r'!\[([^\]]*)\]\(([^)\s]+)')
 RELEVANCE_KEYWORDS = [
     "schematic", "circuit", "diagram", "block diagram", "pinout",
     "waveform", "topology", "layout", "pcb", "wiring",
+    "graph", "chart", "plot", "curve", "figure",
 ]
 
 # Common filler words that happen to be 4+ letters (the threshold used to
