@@ -120,7 +120,20 @@ def _caption_region_pass(page, page_num: int, doc) -> List[PdfFigure]:
     height)`` to ``caption_top``.  This works well for typical datasheets
     where the graph sits immediately above its label, but is not guaranteed
     to capture every figure cleanly.
+
+    Each region is checked for content type before rendering:
+    - Regions with embedded images in the clip are accepted (already captured
+      by the embedded pass, but rendered for completeness).
+    - Regions with vector drawings (lines, curves, filled areas) and moderate
+      text density are accepted (vector-only figures).
+    - Regions with high word count (>100) and no images or drawings are
+      rejected as table-of-contents / index-page running text.
     """
+    # Thresholds for rejecting a region as running text rather than a figure:
+    # real figure regions typically have <100 words in the 40%-height crop;
+    # TOC listings have 100+ words of running text with no figures nearby.
+    _MAX_TEXT_WORDS = 100
+
     result: List[PdfFigure] = []
     blocks = page.get_text("dict").get("blocks", [])
 
@@ -138,6 +151,11 @@ def _caption_region_pass(page, page_num: int, doc) -> List[PdfFigure]:
             if bbox:
                 captions.append((bbox[1], text.strip()))
 
+    # Pre-compute page drawings and image-block info once (avoids re-calling
+    # get_drawings / get_text for each caption on the same page).
+    page_drawings = page.get_drawings()
+    page_text_dict = page.get_text("dict")
+
     for caption_top, caption_text in captions:
         # Region extends upward by ~40% of page height from the caption baseline
         region_top = max(0, caption_top - 0.40 * page_height)
@@ -145,6 +163,39 @@ def _caption_region_pass(page, page_num: int, doc) -> List[PdfFigure]:
         region_bottom = min(page_height, caption_top + page_height * 0.02)
         clip = fitz.Rect(0, region_top, page_width, region_bottom)
 
+        # -- content check ----------------------------------------------------
+        # Count embedded image blocks that overlap the clip region.
+        image_count = 0
+        for block in page_text_dict.get("blocks", []):
+            if block.get("type") != 1:  # 1 = image block
+                continue
+            bbox = block.get("bbox")
+            if bbox:
+                img_rect = fitz.Rect(*bbox)
+                if clip.intersects(img_rect):
+                    image_count += 1
+
+        # Count vector drawings (lines, paths, filled regions) that overlap
+        # the clip region.  A "large" drawing covers >1% of the clip area.
+        clip_area = clip.width * clip.height
+        large_drawing_count = 0
+        for d in page_drawings:
+            d_rect = d.get("rect")
+            if d_rect and clip.intersects(d_rect):
+                inter = d_rect.intersect(clip)
+                if inter.width * inter.height > 0.01 * clip_area:
+                    large_drawing_count += 1
+
+        # Word count in the clip region (excluding caption text itself).
+        words_in_clip = page.get_text("words", clip=clip)
+        word_count = len(words_in_clip)
+
+        # Heuristic: skip if the region looks like running text rather than
+        # a figure — high word count with no images or large drawings.
+        if word_count >= _MAX_TEXT_WORDS and image_count == 0 and large_drawing_count == 0:
+            continue  # TOC / index text — skip
+
+        # -- render -----------------------------------------------------------
         try:
             pix = page.get_pixmap(clip=clip, dpi=150)
             img_bytes = pix.tobytes("png")

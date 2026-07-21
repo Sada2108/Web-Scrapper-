@@ -108,6 +108,15 @@ DEPRIORITIZED_DOMAINS = [
     "stackoverflow.com", "electronics.stackexchange.com",
 ]
 
+# E-commerce / shopping domains that never contain useful technical content.
+# These are hard-excluded (filtered out before ranking).
+EXCLUDED_DOMAINS = [
+    "amazon.com", "amazon.co.uk", "amazon.de", "amazon.fr", "amazon.ca",
+    "ebay.com", "ebay.co.uk", "ebay.de", "ebay.fr",
+    "aliexpress.com", "aliexpress.us",
+    "alibaba.com",
+]
+
 # A lightweight EE vocabulary used to pull technical terms out of the prompt
 # when we don't want to (or can't) call an LLM to do query planning.
 EE_KEYWORD_PATTERNS = [
@@ -395,6 +404,12 @@ class FirecrawlResearcher:
             doc.get("html", "") if isinstance(doc, dict) else ""
         )
 
+        # Unwrap clickable images: [![alt](img)](link) -> ![alt](img).  Many
+        # forum softwares wrap embedded images in a link (e.g. to a "click to
+        # enlarge" or registration page).  For our inline research report the
+        # link is noise, so we strip it unconditionally.
+        markdown = re.sub(r'\[(!\[[^\]]*\]\([^)]+\))\]\([^)]+\)', r'\1', markdown)
+
         # Post-process: strip XenForo "Click to expand..." boilerplate.
         # The content inside bbCodeBlock-expandContent divs is already fully
         # present in the raw HTML -- the label is just UI chrome that pollutes
@@ -579,6 +594,18 @@ class FirecrawlResearcher:
                 if r.get("url"):
                     r["query"] = q
                     candidates.append(r)
+
+        # Hard-exclude e-commerce / shopping domains before ranking.
+        before = len(candidates)
+        candidates = [
+            c for c in candidates
+            if not any(
+                ed in urlparse(c.get("url", "")).netloc.replace("www.", "")
+                for ed in EXCLUDED_DOMAINS
+            )
+        ]
+        if before - len(candidates) > 0:
+            print(f"  [filter] excluded {before - len(candidates)} e-commerce URLs")
 
         candidates = _dedupe_and_rank(
             candidates,
