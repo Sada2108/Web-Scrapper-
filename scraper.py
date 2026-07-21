@@ -344,9 +344,9 @@ class FirecrawlResearcher:
 
         # DigiKey: JS-rendered parametric table — try action-enabled
         # approaches first, then fall back through progressively simpler
-        # strategies (WaitAction → only_main_content=False → JS → basic).
+        # strategies (API → WaitAction → only_main_content=False → JS → basic).
         if "digikey" in host:
-            doc = self._digikey_scrape(url)
+            doc = self._digikey_scrape(url, query=query, context_terms=context_terms)
             if doc is None:
                 return Source(url=url, query=query,
                               error="All DigiKey scrape attempts failed")
@@ -506,8 +506,56 @@ class FirecrawlResearcher:
             images=images,
         )
 
-    def _digikey_scrape(self, url: str):
-        """Fallback chain for DigiKey pages (JS-rendered parametric table)."""
+    def _digikey_scrape(self, url: str, query: str = "",
+                        context_terms: Optional[List[str]] = None):
+        """Fallback chain for DigiKey pages (API → scrape approaches)."""
+
+        # e) Product Information API — fastest and most reliable when the
+        #    client credentials are configured and the API is subscribed.
+        #    Must run before any scrape attempt; exits early on success.
+        dk_id = os.environ.get("DIGIKEY_CLIENT_ID", "")
+        dk_secret = os.environ.get("DIGIKEY_CLIENT_SECRET", "")
+        if dk_id and dk_secret:
+            try:
+                pn = _digikey_part_from_url(url) or _digikey_part_from_query(
+                    query, context_terms
+                )
+                if pn:
+                    from digikey_api import DigiKeyClient, DigiKeyNotFoundError, \
+                        DigiKeyAuthError, make_markdown
+                    # Try production first, then sandbox
+                    for base in ("api.digikey.com", "sandbox-api.digikey.com"):
+                        client = DigiKeyClient(
+                            client_id=dk_id, client_secret=dk_secret,
+                            base_url=base,
+                        )
+                        try:
+                            details = client.get_product_details(pn)
+                            markdown = make_markdown(details)
+                            # Also include a JSON metadata block for the
+                            # structured data export
+                            meta = {"title": f"{pn} — DigiKey Product Details"}
+                            print(f"DigiKey: API served data for {pn} "
+                                  f"via {base}")
+                            return {
+                                "markdown": markdown,
+                                "html": "",
+                                "images": [],
+                                "metadata": meta,
+                            }
+                        except DigiKeyAuthError as e:
+                            print(f"DigiKey: API auth failed on {base} "
+                                  f"— {e}", file=sys.stderr)
+                            continue
+                        except DigiKeyNotFoundError:
+                            return Source(
+                                url=url, query=query,
+                                error=f"Part '{pn}' not found in DigiKey catalogue"
+                            )
+            except Exception as e:
+                print(f"DigiKey: API approach failed — {e}",
+                      file=sys.stderr)
+
         # a) WaitAction: wait for product table rows to appear
         if WaitAction is not None:
             try:
@@ -1178,3 +1226,43 @@ def corpus_to_markdown(corpus: ResearchCorpus) -> str:
             lines.append(f"- {s.url} — {s.error}")
 
     return "\n".join(lines)
+
+
+# ── DigiKey helpers ───────────────────────────────────────────────────────────
+
+def _digikey_part_from_url(url: str) -> Optional[str]:
+    """
+    Extract a likely part number from a DigiKey product URL.
+
+    Heuristic: the last path segment that looks like a part number
+    (contains a letter followed by a digit, or has a hyphen with letters
+    on both sides) is taken.  Purely-numeric segments and common words
+    like ``detail``, ``filter``, ``base-product`` are ignored.
+    """
+    parsed = urlparse(url)
+    segments = [s for s in parsed.path.split("/") if s and s not in (
+        "en", "products", "detail", "base-product", "filter", "search"
+    )]
+    # Walk backwards: the part number is usually near the end of the path
+    for seg in reversed(segments):
+        # Must have at least one letter AND one digit
+        if re.search(r"[A-Za-z]", seg) and re.search(r"\d", seg):
+            return seg.upper()
+    return None
+
+
+def _digikey_part_from_query(query: str,
+                              context_terms: Optional[List[str]] = None) -> Optional[str]:
+    """
+    Fallback: use the search query or context terms as the part number.
+    """
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9\-\.]+", query or "")
+    for w in words:
+        if re.search(r"[A-Za-z]", w) and re.search(r"\d", w):
+            return w.upper()
+
+    if context_terms:
+        for t in context_terms:
+            if re.search(r"[A-Za-z]", t) and re.search(r"\d", t):
+                return t.upper()
+    return None
