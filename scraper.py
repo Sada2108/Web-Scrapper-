@@ -17,6 +17,9 @@ Env var:  FIRECRAWL_API_KEY  (or pass api_key= explicitly)
 
 from __future__ import annotations
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import json
 import os
 import re

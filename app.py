@@ -17,6 +17,9 @@ scraper. Enter a design prompt (like a Flux-AI-style spec), and it will:
 Run with:  streamlit run app.py
 """
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import os
 import re
 import time

@@ -11,7 +11,6 @@ Base URL is parameterized — use ``sandbox-api.digikey.com`` for testing
 or ``api.digikey.com`` for production.  Access tokens are cached in memory
 and automatically refreshed when expired.
 """
-
 import json
 import os
 import time
@@ -160,31 +159,49 @@ class DigiKeyClient:
 
     @staticmethod
     def _normalize(raw: dict, requested_pn: str) -> dict:
-        """Flatten the verbose API response into a compact dict."""
-        # Price breaks: list of {qty, price}
+        """Flatten the verbose API response into a compact dict.
+
+        The V4 ProductDetails response wraps the product under a
+        ``Product`` key; this method handles both the wrapped and
+        unwrapped shapes.
+        """
+        p = raw.get("Product") or raw
+
         price_breaks = []
-        for pb in raw.get("priceBreaks", []):
-            qty = pb.get("breakQuantity", 0)
-            price = pb.get("unitPrice", 0.0)
-            if qty and price:
-                price_breaks.append({"qty": qty, "price": float(price)})
+        # V4 nests price breaks inside each ProductVariations entry
+        for var in p.get("ProductVariations", []):
+            for pb in var.get("StandardPricing", []):
+                qty = pb.get("BreakQuantity", 0)
+                price = pb.get("UnitPrice", 0.0)
+                if qty and price:
+                    price_breaks.append({"qty": qty, "price": float(price)})
+        # Fallback: flat priceBreaks list (older / sandbox shape)
+        if not price_breaks:
+            for pb in p.get("priceBreaks", []):
+                qty = pb.get("BreakQuantity", pb.get("breakQuantity", 0))
+                price = pb.get("UnitPrice", pb.get("unitPrice", 0.0))
+                if qty and price:
+                    price_breaks.append({"qty": qty, "price": float(price)})
         price_breaks.sort(key=lambda x: x["qty"])
 
+        desc = p.get("Description") or {}
+        manufacturer = p.get("Manufacturer") or {}
+
         return {
-            "part_number": raw.get("digiKeyPartNumber", requested_pn),
-            "description": raw.get("productDescription")
-                           or raw.get("detailedDescription", ""),
-            "manufacturer": (
-                (raw.get("manufacturer", {}) or {}).get("name", "")
-            ),
-            "quantity_available": (
-                (raw.get("quantityAvailable", 0)) or
-                (raw.get("salesInfo", {}) or {}).get("quantityAvailable", 0)
-            ),
+            "part_number": (p.get("DigiKeyProductNumber")
+                            or p.get("digiKeyPartNumber")
+                            or requested_pn),
+            "description": (p.get("productDescription")
+                            or p.get("ProductDescription")
+                            or desc.get("ProductDescription", "")),
+            "manufacturer": (manufacturer.get("Name")
+                             or manufacturer.get("name", "")),
+            "quantity_available": (p.get("QuantityAvailable", 0)
+                                   or p.get("quantityAvailable", 0)),
             "price_breaks": price_breaks,
-            "datasheet_url": raw.get("datasheetUrl"),
+            "datasheet_url": p.get("DatasheetUrl") or p.get("datasheetUrl"),
             "category": (
-                (raw.get("category", {}) or {}).get("path", "")
+                (p.get("category") or p.get("Category") or {}).get("path", "")
             ),
         }
 

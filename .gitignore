@@ -27,3 +27,4 @@ cache/
 
 # Misc
 .python-version
+.env
