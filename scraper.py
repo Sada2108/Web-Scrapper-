@@ -30,7 +30,7 @@ import requests
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import List, Dict, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 from firecrawl import Firecrawl
 try:
@@ -458,7 +458,8 @@ class FirecrawlResearcher:
         # by context in the first place.
         already_have = {img.url for img in images}
         html_images = [
-            img for img in extract_images(html or "", "", context_terms=context_terms)
+            img for img in extract_images(html or "", "", context_terms=context_terms,
+                                          base_url=url)
             if img.url not in already_have and img.relevance_score > 0
         ]
         if html_images:
@@ -1007,18 +1008,29 @@ def extract_interleaved_content(
     return "\n\n".join(kept_blocks), kept_images
 
 
-def extract_images(html: str, markdown: str = "", context_terms: Optional[List[str]] = None) -> List[ScrapedImage]:
+def extract_images(html: str, markdown: str = "", context_terms: Optional[List[str]] = None,
+                   base_url: str = "") -> List[ScrapedImage]:
     found: Dict[str, ScrapedImage] = {}
 
     for m in IMG_TAG_RE.finditer(html or ""):
         src = m.group(0)
         url = m.group(1)
+        # Resolve relative / protocol-relative URLs against the page
+        if base_url and not url.startswith(("http://", "https://", "data:")):
+            url = urljoin(base_url, url)
+        # Skip data: URIs — inline base64 spacers/tracking pixels
+        if url.startswith("data:"):
+            continue
         alt_match = ALT_RE.search(src)
         alt = alt_match.group(1) if alt_match else ""
         found[url] = ScrapedImage(url=url, alt=alt, relevance_score=_score_image(url, alt, context_terms))
 
     for m in MD_IMG_RE.finditer(markdown or ""):
         alt, url = m.group(1), m.group(2)
+        if base_url and not url.startswith(("http://", "https://", "data:")):
+            url = urljoin(base_url, url)
+        if url.startswith("data:"):
+            continue
         if url not in found:
             found[url] = ScrapedImage(url=url, alt=alt, relevance_score=_score_image(url, alt, context_terms))
 
