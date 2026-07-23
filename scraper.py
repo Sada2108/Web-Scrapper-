@@ -145,7 +145,24 @@ EE_KEYWORD_PATTERNS = [
 # OPA2340, MAX232, NE555 etc.  Case-insensitive so "lm386" matches as
 # well as "LM386".  When normalizing, the canonical form is UPPERCASE
 # (datasheets/search engines use uppercase part numbers).
-_PART_NUMBER_RE = re.compile(r"\b([A-Z]{2,5})[\s\-]?(\d{2,5}[A-Z]?)\b", re.IGNORECASE)
+#
+# IMPORTANT: no \s in the separator. Real part numbers are written with
+# no space (LM386) or a hyphen (MCP6001-E), never a literal space. Allowing
+# a space here caused ordinary English phrases like "below 100" (as in
+# "resolving signals below 100 nV") or "over 5" to be misread as part
+# numbers ("BELOW100"), which then got treated as the single strongest
+# search signal and hijacked the whole query set.
+_PART_NUMBER_RE = re.compile(r"\b([A-Z]{2,5})-?(\d{2,5}[A-Z]?)\b", re.IGNORECASE)
+
+# Common English words that are 2-5 letters and could still precede a
+# number with no space in ordinary prose. Treated as a hard blocklist so
+# they can never be mistaken for a part-number prefix, even with the
+# tightened separator rule above.
+_PART_NUMBER_WORD_BLOCKLIST = {
+    "below", "above", "over", "under", "less", "more", "than", "about",
+    "up", "to", "at", "in", "on", "of", "top", "type", "class", "grade",
+    "gain", "rev", "version", "no", "num", "page", "step", "part",
+}
 
 
 def _extract_context_terms(prompt: str) -> List[str]:
@@ -1006,6 +1023,109 @@ def extract_interleaved_content(
     ]
 
     return "\n\n".join(kept_blocks), kept_images
+
+
+# --------------------------------------------------------------------------
+# Circuits & Schematics gallery -- one card per image, full context attached
+# --------------------------------------------------------------------------
+
+def extract_circuit_entries(source: "Source") -> List[Dict]:
+    """
+    Build a flat, per-image list of "circuit card" entries from an already
+    -interleaved Source.markdown, for a dedicated schematics/circuits view.
+
+    Unlike the flowing research report (which mixes text and images into
+    one continuous read), this pulls each image out with BOTH of its
+    immediate neighboring text blocks attached IN FULL -- nothing
+    truncated, nothing summarized -- so a schematic is never shown without
+    the paragraph(s) that were actually describing it on the source page.
+
+    Returns a list of dicts, one per image, in original reading order:
+      {
+        "heading":         nearest preceding markdown heading in the
+                            source (falls back to the source title),
+        "image_url":       image URL, or a local file path for PDF-
+                            extracted figures,
+        "alt":              image alt text / caption,
+        "relevance_score":  int, carried over from the scored ScrapedImage,
+        "context_before":   full text block immediately before the image
+                             (empty string if none),
+        "context_after":    full text block immediately after the image
+                             (empty string if none),
+        "source_title":     source.title,
+        "source_url":       source.url,
+        "query":            source.query,
+      }
+    """
+    blocks = _split_blocks(source.markdown)
+    if not blocks:
+        return []
+
+    # Map image URL -> ScrapedImage so we reuse the score already computed
+    # for the flowing report instead of rescoring from scratch.
+    by_url = {img.url: img for img in source.images}
+
+    def _is_image_block(b: str) -> bool:
+        imgs = _block_images(b)
+        return bool(imgs) and len(MD_IMG_RE.sub("", b).strip()) < 20
+
+    entries: List[Dict] = []
+    current_heading = source.title
+
+    for i, block in enumerate(blocks):
+        if block.startswith("#"):
+            current_heading = block.lstrip("#").strip() or current_heading
+            continue
+
+        if not _is_image_block(block):
+            continue
+
+        # Nearest preceding / following TEXT block (skip headings and other
+        # image blocks) -- kept whole, no character trimming, so nothing
+        # about the circuit's description is lost.
+        context_before = ""
+        for j in range(i - 1, -1, -1):
+            b = blocks[j]
+            if b.startswith("#") or _is_image_block(b):
+                continue
+            context_before = b
+            break
+
+        context_after = ""
+        for j in range(i + 1, len(blocks)):
+            b = blocks[j]
+            if b.startswith("#") or _is_image_block(b):
+                continue
+            context_after = b
+            break
+
+        for img in _block_images(block):
+            known = by_url.get(img.url)
+            entries.append({
+                "heading": current_heading,
+                "image_url": img.url,
+                "alt": (known.alt if known else img.alt) or "",
+                "relevance_score": known.relevance_score if known else img.relevance_score,
+                "context_before": context_before,
+                "context_after": context_after,
+                "source_title": source.title,
+                "source_url": source.url,
+                "query": source.query,
+            })
+
+    return entries
+
+
+def build_circuit_gallery(corpus: "ResearchCorpus") -> List[Dict]:
+    """Run extract_circuit_entries() across every successfully-scraped
+    source in the corpus and return one flat, ordered list -- the full
+    data set behind the 'Circuits & Schematics' tab."""
+    gallery: List[Dict] = []
+    for s in corpus.sources:
+        if s.error:
+            continue
+        gallery.extend(extract_circuit_entries(s))
+    return gallery
 
 
 def extract_images(html: str, markdown: str = "", context_terms: Optional[List[str]] = None,

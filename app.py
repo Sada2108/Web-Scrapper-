@@ -29,6 +29,7 @@ from scraper import (
     FirecrawlResearcher,
     generate_search_queries,
     corpus_to_markdown,
+    build_circuit_gallery,
 )
 
 st.set_page_config(page_title="PCB Design Research Scraper", page_icon="🔩", layout="wide")
@@ -186,7 +187,9 @@ if corpus:
     m2.metric("Relevant images found", total_images)
     m3.metric("Failed fetches", len(failed_sources))
 
-    tab_report, tab_export = st.tabs(["📊 Research Report", "⬇️ Export"])
+    tab_report, tab_circuits, tab_export = st.tabs(
+        ["📊 Research Report", "🔌 Circuits & Schematics", "⬇️ Export"]
+    )
 
     with tab_report:
         st.caption(
@@ -241,6 +244,47 @@ if corpus:
             with st.expander(f"⚠️ {len(failed_sources)} pages failed to scrape"):
                 for s in failed_sources:
                     st.caption(f"❌ {s.url} — {s.error}")
+
+    with tab_circuits:
+        # One card per image, pulled out of the interleaved report with
+        # BOTH neighboring text blocks attached in full -- so every
+        # schematic keeps the exact context that was describing it on the
+        # source page, instead of showing up as a bare picture.
+        gallery = build_circuit_gallery(corpus)
+
+        if not gallery:
+            st.info("No circuits or schematics were found for this prompt.")
+        else:
+            st.caption(f"🔩 {len(gallery)} circuits/schematics found across {len(ok_sources)} sources")
+
+            for i, entry in enumerate(gallery, 1):
+                with st.container(border=True):
+                    st.markdown(f"**Context:** [{entry['heading']}]")
+                    st.caption(f"relevance score: {entry['relevance_score']}")
+
+                    if entry["context_before"]:
+                        st.markdown(entry["context_before"])
+
+                    # Render the image -- local PDF-extracted figures use a
+                    # filesystem path, everything else is a normal URL.
+                    if entry["image_url"].startswith("http"):
+                        st.image(entry["image_url"], caption=entry["alt"] or None)
+                    else:
+                        from pathlib import Path
+                        path = Path(entry["image_url"])
+                        if path.exists():
+                            st.image(str(path), caption=entry["alt"] or None)
+                        elif entry["alt"]:
+                            st.caption(f"*{entry['alt']}*")
+
+                    if entry["context_after"]:
+                        st.markdown(f"**Context:** [{entry['source_title']}]  \n{entry['context_after']}")
+                        st.caption(f"relevance score: {entry['relevance_score']}")
+
+                    st.caption(
+                        f"🔗 [{entry['source_title']}]({entry['source_url']})  "
+                        f"·  matched query: *{entry['query']}*"
+                    )
 
     with tab_export:
         md_export = corpus_to_markdown(corpus)
